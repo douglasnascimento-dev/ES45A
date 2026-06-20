@@ -18,6 +18,9 @@ Como rodar:
     python master.py --workers 2 --linhas 100 --colunas 100 --geracoes 80 --animar
     python master.py --workers 2 --linhas 100 --colunas 100 --geracoes 80 --salvar propagacao.gif
 
+    # Demo entre máquinas (master aceita conexões de qualquer interface):
+    python master.py --workers 4 --host 0.0.0.0 --porta 5050 --linhas 350
+
 Dependências:
     pip install psutil matplotlib pillow
 """
@@ -44,8 +47,9 @@ from matplotlib.colors import ListedColormap
 # ─────────────────────────────────────────────
 # Constantes (devem ser idênticas ao worker.py)
 # ─────────────────────────────────────────────
-HOST  = 'localhost'
-PORTA = 65432
+HOST_PADRAO  = '0.0.0.0'   # aceita conexões de qualquer interface
+PORTA_PADRAO = 65432
+TIMEOUT_SEG  = 300         # rede-de-segurança: aborta se algo travar por > 5 min
 
 IGNORANTE      = 0
 ESPALHADOR     = 1
@@ -75,9 +79,10 @@ def _receber_exato(sock, n):
 
 
 def enviar(sock, objeto):
-    dados = pickle.dumps(objeto)
-    sock.sendall(struct.pack('>I', len(dados)))
-    sock.sendall(dados)
+    # protocolo explícito (mais rápido e estável entre versões de Python)
+    dados = pickle.dumps(objeto, protocol=pickle.HIGHEST_PROTOCOL)
+    # uma única chamada sendall evita possível fragmentação em 2 pacotes TCP
+    sock.sendall(struct.pack('>I', len(dados)) + dados)
 
 
 def receber(sock):
@@ -383,7 +388,7 @@ def imprimir_estatisticas(geracao, total, tempo_geracao=None):
     )
 
 
-def gerar_relatorio_ambiente(num_workers):
+def gerar_relatorio_ambiente(num_workers, host, porta):
     print("=" * 65)
     print("  CONFIGURAÇÃO EXPERIMENTAL — AMBIENTE DE EXECUÇÃO (MASTER)")
     print("=" * 65)
@@ -395,22 +400,24 @@ def gerar_relatorio_ambiente(num_workers):
         print(f"Memória RAM Total    : {psutil.virtual_memory().total / (1024**3):.2f} GB")
     print(f"Versão Python        : {sys.version.split()[0]}")
     print(f"Workers configurados : {num_workers}")
-    print(f"Comunicação          : Sockets TCP — porta única {PORTA}")
+    print(f"Comunicação          : Sockets TCP — {host}:{porta}")
     print("=" * 65)
 
 
 # ─────────────────────────────────────────────
 # Conexão com workers
 # ─────────────────────────────────────────────
-def conectar_workers(num_workers):
+def conectar_workers(num_workers, host, porta):
     servidor = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     servidor.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    servidor.bind((HOST, PORTA))
+    servidor.bind((host, porta))
     servidor.listen(num_workers)
-    print(f"\nAguardando {num_workers} worker(s) na porta {PORTA}...")
+    print(f"\nAguardando {num_workers} worker(s) em {host}:{porta}...")
     sockets = []
     for idx in range(num_workers):
         conn, addr = servidor.accept()
+        # rede-de-segurança: aborta se algo travar por mais de TIMEOUT_SEG
+        conn.settimeout(TIMEOUT_SEG)
         sockets.append(conn)
         print(f"  Worker {idx} conectado ({addr[0]}:{addr[1]})")
     servidor.close()
@@ -432,8 +439,10 @@ def executar_master(
     semente=15,
     animar=False,
     salvar_animacao=None,
+    host=HOST_PADRAO,
+    porta=PORTA_PADRAO,
 ):
-    gerar_relatorio_ambiente(num_workers)
+    gerar_relatorio_ambiente(num_workers, host, porta)
 
     # ── 1. Cria grade completa ─────────────────────────────────────
     print("Criando grade inicial...")
@@ -457,7 +466,7 @@ def executar_master(
               f"({f['num_linhas']} linhas reais)")
 
     # ── 3. Conecta aos workers ─────────────────────────────────────
-    workers = conectar_workers(num_workers)
+    workers = conectar_workers(num_workers, host, porta)
 
     # ── 4. Envia configuração inicial ──────────────────────────────
     coletar_grade = animar or (salvar_animacao is not None)
@@ -479,7 +488,23 @@ def executar_master(
     tracemalloc.start()
     tempo_total_inicio = time.perf_counter()
 
-    historico_stats  = []
+    # historico_stats começa com a contagem do estado INICIAL (geração 0),
+    # casando 1:1 com historico_visuais. Sem isso, o gráfico de evolução
+    # ficaria 1 frame mais curto que a animação da grade.
+    plano_inicial = [c for linha in visual_inicial for c in linha]
+    stats_inicial = {
+        'ignorantes'    : plano_inicial.count(0),
+        'afetados_A'    : plano_inicial.count(1),
+        'afetados_B'    : plano_inicial.count(2),
+        'colisoes'      : plano_inicial.count(3),
+        'obstaculos'    : plano_inicial.count(4),
+        'fact_checkers' : plano_inicial.count(5),
+        # No estado inicial não há INATIVO ainda, então todos os "afetados"
+        # ainda são espalhadores ativos.
+        'espalhadores_A': plano_inicial.count(1),
+        'espalhadores_B': plano_inicial.count(2),
+    }
+    historico_stats   = [stats_inicial]
     historico_visuais = [visual_inicial]  # começa com estado inicial
 
     geracao_final = 0
@@ -574,16 +599,20 @@ def executar_master(
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Master — Simulação Distribuída Fake News')
-    parser.add_argument('--workers',      type=int,   default=2,     help='Número de workers')
-    parser.add_argument('--linhas',       type=int,   default=100,   help='Linhas da grade')
-    parser.add_argument('--colunas',      type=int,   default=100,   help='Colunas da grade')
-    parser.add_argument('--geracoes',     type=int,   default=80,    help='Máximo de gerações')
-    parser.add_argument('--espalhadores', type=float, default=0.02,  help='%% inicial de espalhadores')
-    parser.add_argument('--obstaculos',   type=float, default=0.08,  help='%% de obstáculos')
-    parser.add_argument('--cura',         type=float, default=0.002, help='%% de fact-checkers')
-    parser.add_argument('--semente',      type=int,   default=15,    help='Semente RNG')
-    parser.add_argument('--animar',       action='store_true',       help='Exibe animação ao final')
-    parser.add_argument('--salvar',       type=str,   default=None,  help='Salva animação (.gif ou .mp4)')
+    parser.add_argument('--workers',      type=int,   default=2,             help='Número de workers')
+    parser.add_argument('--linhas',       type=int,   default=100,           help='Linhas da grade')
+    parser.add_argument('--colunas',      type=int,   default=100,           help='Colunas da grade')
+    parser.add_argument('--geracoes',     type=int,   default=80,            help='Máximo de gerações')
+    parser.add_argument('--espalhadores', type=float, default=0.02,          help='%% inicial de espalhadores')
+    parser.add_argument('--obstaculos',   type=float, default=0.08,          help='%% de obstáculos')
+    parser.add_argument('--cura',         type=float, default=0.002,         help='%% de fact-checkers')
+    parser.add_argument('--semente',      type=int,   default=15,            help='Semente RNG')
+    parser.add_argument('--animar',       action='store_true',               help='Exibe animação ao final')
+    parser.add_argument('--salvar',       type=str,   default=None,          help='Salva animação (.gif ou .mp4)')
+    parser.add_argument('--host',         type=str,   default=HOST_PADRAO,
+                        help=f'Interface de bind (default: {HOST_PADRAO} — aceita de qualquer máquina)')
+    parser.add_argument('--porta',        type=int,   default=PORTA_PADRAO,
+                        help=f'Porta TCP (default: {PORTA_PADRAO})')
     args = parser.parse_args()
 
     executar_master(
@@ -597,4 +626,6 @@ if __name__ == '__main__':
         semente           = args.semente,
         animar            = args.animar,
         salvar_animacao   = args.salvar,
+        host              = args.host,
+        porta             = args.porta,
     )

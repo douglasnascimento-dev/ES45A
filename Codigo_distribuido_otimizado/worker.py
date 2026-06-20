@@ -13,9 +13,12 @@ Responsabilidades do worker:
         e. Aguardar instrução de continuar ou parar
 
 Como rodar (após iniciar o master):
-    python worker.py
-    python worker.py
-    (cada um em um terminal separado — o master os identifica pela ordem de chegada)
+    python worker.py                                  # conecta em localhost:65432
+    python worker.py --host 192.168.1.10              # master em outra máquina
+    python worker.py --host 192.168.1.10 --porta 5050 # porta customizada
+
+    (cada worker em um terminal separado — o master os identifica
+     pela ordem de chegada)
 """
 
 import socket
@@ -28,8 +31,9 @@ import random
 # ─────────────────────────────────────────────
 # Constantes (devem ser idênticas ao master.py)
 # ─────────────────────────────────────────────
-HOST  = 'localhost'
-PORTA = 65432
+HOST_PADRAO  = 'localhost'
+PORTA_PADRAO = 65432
+TIMEOUT_SEG  = 300   # rede-de-segurança: se algo travar, abortar após 5 min
 
 IGNORANTE      = 0
 ESPALHADOR     = 1
@@ -57,9 +61,10 @@ def _receber_exato(sock, n):
 
 
 def enviar(sock, objeto):
-    dados = pickle.dumps(objeto)
-    sock.sendall(struct.pack('>I', len(dados)))
-    sock.sendall(dados)
+    # protocolo explícito (mais rápido e estável entre versões de Python)
+    dados = pickle.dumps(objeto, protocol=pickle.HIGHEST_PROTOCOL)
+    # uma única chamada sendall evita possível fragmentação em 2 pacotes TCP
+    sock.sendall(struct.pack('>I', len(dados)) + dados)
 
 
 def receber(sock):
@@ -303,17 +308,19 @@ def proxima_geracao_local(grade_local, semente, geracao, linha_inicio):
 # ─────────────────────────────────────────────
 # Loop principal do worker
 # ─────────────────────────────────────────────
-def executar_worker():
-    print(f"[WORKER] Conectando ao master em {HOST}:{PORTA}...")
+def executar_worker(host=HOST_PADRAO, porta=PORTA_PADRAO):
+    print(f"[WORKER] Conectando ao master em {host}:{porta}...")
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    # rede-de-segurança: aborta se algo travar por mais de TIMEOUT_SEG
+    sock.settimeout(TIMEOUT_SEG)
 
     # Tenta conectar com retries (master pode ainda estar inicializando)
     for tentativa in range(15):
         try:
-            sock.connect((HOST, PORTA))
+            sock.connect((host, porta))
             break
-        except ConnectionRefusedError:
+        except (ConnectionRefusedError, socket.timeout, OSError) as e:
             print(f"[WORKER] Master não disponível ainda, aguardando... ({tentativa+1}/15)")
             time.sleep(1)
     else:
@@ -384,4 +391,13 @@ def executar_worker():
 # Entry point
 # ─────────────────────────────────────────────
 if __name__ == '__main__':
-    executar_worker()
+    parser = argparse.ArgumentParser(
+        description='Worker — Simulação Distribuída de Fake News'
+    )
+    parser.add_argument('--host',  type=str, default=HOST_PADRAO,
+                        help=f'Endereço do master (default: {HOST_PADRAO})')
+    parser.add_argument('--porta', type=int, default=PORTA_PADRAO,
+                        help=f'Porta do master (default: {PORTA_PADRAO})')
+    args = parser.parse_args()
+
+    executar_worker(host=args.host, porta=args.porta)

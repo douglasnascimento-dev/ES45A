@@ -508,8 +508,8 @@ if __name__ == "__main__":
 
     # 1) Benchmark headless (dados para tabelas de speedup/eficiência)
     resultado = executar_simulacao(
-        linhas=50,
-        colunas=50,
+        linhas=350,
+        colunas=350,
         geracoes=150,
         modo_grafico=False,
     )
