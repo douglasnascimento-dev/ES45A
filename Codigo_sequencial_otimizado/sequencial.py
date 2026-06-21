@@ -373,9 +373,9 @@ def contar_estados_visual(visual):
 # Execução principal
 # ----------------------------------------------------------------------
 def executar_simulacao(
-    linhas=100,
-    colunas=100,
-    geracoes=80,
+    linhas=400,
+    colunas=400,
+    geracoes=150,
     perc_espalhadores=0.02,
     perc_obstaculos=0.08,
     perc_cura=0.002,
@@ -508,8 +508,8 @@ if __name__ == "__main__":
 
     # 1) Benchmark headless (dados para tabelas de speedup/eficiência)
     resultado = executar_simulacao(
-        linhas=350,
-        colunas=350,
+        linhas=400,
+        colunas=400,
         geracoes=150,
         modo_grafico=False,
     )
@@ -519,12 +519,12 @@ if __name__ == "__main__":
     if em_jupyter():
         from IPython.display import display
         anim = executar_simulacao(
-            linhas=150, colunas=150, geracoes=100, modo_grafico=True,
+            linhas=400, colunas=400, geracoes=150, modo_grafico=True,
         )
         display(anim)
     else:
         executar_simulacao(
-            linhas=150, colunas=150, geracoes=100,
+            linhas=400, colunas=400, geracoes=150,
             modo_grafico=True,
             salvar_animacao='propagacao.gif',
         )
