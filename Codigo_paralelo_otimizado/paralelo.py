@@ -1,21 +1,32 @@
 """
-Simulação Paralela de Propagação de Fake News
-----------------------------------------------
+Simulação com Multiprocessing de Propagação de Fake News
+---------------------------------------------------------
 
-Versão paralela com Threads (threading + ThreadPoolExecutor).
-Mantém a mesma lógica de simulação da versão sequencial, dividindo o
-trabalho de cada geração entre N threads por faixas de linhas.
+Implementação adicional (proposta como MELHORIA/INOVAÇÃO):
+comparação de paradigmas paralelos - threads vs processos em CPython.
 
-Garantias importantes:
-    - Reprodutibilidade exata: para a mesma semente, qualquer número de
-      threads produz o mesmo resultado final da versão sequencial.
-      (Determinismo via RNG derivado por célula: rng_celula(semente, g, i, j))
-    - Ausência de race condition: cada thread lê do snapshot imutável
-      (`grade`) e escreve apenas em sua faixa exclusiva de `nova_grade`.
-      Nenhum lock é necessário.
-    - Paralelização explícita: divisão de carga implementada manualmente
-      por faixas de linhas, sem uso de bibliotecas de paralelização
-      automática (NumPy vetorizado, Numba, etc.).
+Por que esta versão existe:
+    A versão paralela com Threads é limitada pelo GIL do CPython - o
+    bytecode Python é serializado mesmo com múltiplas threads. Esta
+    versão usa multiprocessing.shared_memory para contornar o GIL
+    completamente, com cada processo executando em paralelo real.
+
+Diferenças técnicas em relação à versão com threads:
+    - Cada worker é um processo independente, sem GIL compartilhado.
+    - Comunicação via memória compartilhada (shared_memory) com dois
+      buffers que alternam papel de leitura/escrita a cada geração.
+      Custo de comunicação ~zero por geração (sem serialização).
+    - Grade representada internamente como buffer plano de inteiros
+      (5 atributos por célula), ao invés de objetos Individuo.
+
+Garantias preservadas:
+    - Determinismo: mesma semente -> mesmo resultado da versão
+      sequencial, independente do número de processos.
+      (RNG derivado por célula: rng_celula(semente, g, i, j))
+    - Sem race condition: workers escrevem em faixas exclusivas de
+      linhas do buffer de destino. Sem locks.
+    - Paralelização explícita: divisão de carga manual por faixas
+      de linhas, sem uso de bibliotecas de paralelização automática.
 """
 
 import random
@@ -24,8 +35,8 @@ import platform
 import sys
 import os
 import tracemalloc
-import threading
-from concurrent.futures import ThreadPoolExecutor
+import multiprocessing as mp
+from multiprocessing import shared_memory
 
 try:
     import psutil
@@ -48,23 +59,24 @@ TIPO_NORMAL = 0
 TIPO_OBSTACULO = 1
 TIPO_FACT_CHECKER = 2
 
+# Layout da célula no buffer plano: 5 inteiros consecutivos
+OFF_EST_A = 0   # estado_A
+OFF_MUT_A = 1   # mutacao_A
+OFF_EST_B = 2   # estado_B
+OFF_MUT_B = 3   # mutacao_B
+OFF_TIPO  = 4   # tipo
+N_ATTRS   = 5
+
 MAPA_CORES = ListedColormap(
     ['#FFFFFF', '#E63946', '#457B9D', '#7209B7', '#4A4A4A', '#007504']
 )
 
-
 # ----------------------------------------------------------------------
-# RNG determinístico por célula
-# ----------------------------------------------------------------------
-# Mesma função do sequencial. Garante que, para a mesma semente, qualquer
-# ordem de processamento (1 thread, 8 threads, embaralhado) produza o
-# mesmo resultado. Sem isso, threads paralelas consumiriam o RNG global
-# em ordem imprevisível e a versão paralela divergiria do sequencial.
+# RNG determinístico por célula (mesmo do sequencial)
 # ----------------------------------------------------------------------
 _MASK64 = 0xFFFFFFFFFFFFFFFF
 
 def rng_celula(semente, geracao, i, j):
-    """Retorna um random.Random determinístico para a célula (i,j) na geração dada."""
     s = (
         (semente * 0x9E3779B97F4A7C15)
         ^ (geracao * 0xBF58476D1CE4E5B9)
@@ -75,7 +87,7 @@ def rng_celula(semente, geracao, i, j):
 
 
 # ----------------------------------------------------------------------
-# Classe Indivíduo
+# Classe Individuo (mantida para API e comparabilidade com outras versões)
 # ----------------------------------------------------------------------
 class Individuo:
     __slots__ = ['estado_A', 'mutacao_A', 'estado_B', 'mutacao_B', 'tipo']
@@ -87,18 +99,9 @@ class Individuo:
         self.mutacao_B = 0
         self.tipo = TIPO_NORMAL
 
-    def clonar(self):
-        n = Individuo()
-        n.estado_A = self.estado_A
-        n.mutacao_A = self.mutacao_A
-        n.estado_B = self.estado_B
-        n.mutacao_B = self.mutacao_B
-        n.tipo = self.tipo
-        return n
-
 
 # ----------------------------------------------------------------------
-# Ambiente / Relatório
+# Ambiente
 # ----------------------------------------------------------------------
 def em_jupyter():
     try:
@@ -109,7 +112,7 @@ def em_jupyter():
         return False
 
 
-def gerar_relatorio_ambiente(num_threads=0):
+def gerar_relatorio_ambiente(num_processos=0):
     print("=" * 60)
     print(" CONFIGURAÇÃO EXPERIMENTAL - AMBIENTE DE EXECUÇÃO ")
     print("=" * 60)
@@ -121,19 +124,15 @@ def gerar_relatorio_ambiente(num_threads=0):
         print(f"Memória RAM Total    : {psutil.virtual_memory().total / (1024**3):.2f} GB")
     print(f"Versão Interpretador : {sys.version.split(' ')[0]}")
     print(f"Ambiente             : {'Jupyter/IPython' if em_jupyter() else 'Script (CPython)'}")
-    if num_threads:
-        print(f"Threads na Simulação : {num_threads}")
+    if num_processos:
+        print(f"Processos na Simulação: {num_processos}")
     print("=" * 60)
 
 
 # ----------------------------------------------------------------------
-# Divisão de carga entre threads
+# Divisão de carga
 # ----------------------------------------------------------------------
 def _fatiar(total, n):
-    """
-    Divide [0, total) em n fatias contíguas, distribuindo o resto da divisão
-    como +1 linha nas primeiras fatias. Balanceamento máximo, nenhuma fatia ociosa.
-    """
     base, extra = divmod(total, n)
     pos = 0
     for i in range(n):
@@ -144,12 +143,8 @@ def _fatiar(total, n):
 
 
 # ----------------------------------------------------------------------
-# Criação da grade inicial
+# Criação da grade inicial (idêntica ao sequencial - garante reprodutibilidade)
 # ----------------------------------------------------------------------
-# Mantida estritamente serial e idêntica ao sequencial. Paralelizar a
-# inicialização aqui não compensa (criação de Individuos é barata e ocorre
-# apenas uma vez), e qualquer divergência aqui quebraria a reprodutibilidade
-# com o sequencial.
 def criar_grade(linhas, colunas, perc_espalhadores=0.02,
                 perc_obstaculos=0.08, perc_cura=0.002, semente=15):
     rng_init = random.Random(semente)
@@ -163,32 +158,92 @@ def criar_grade(linhas, colunas, perc_espalhadores=0.02,
 
     n_por_news = int((total * perc_espalhadores) / 2)
 
-    alocados = 0
-    while alocados < n_por_news:
+    c = 0
+    while c < n_por_news:
         i = rng_init.randint(0, int(linhas * 0.3))
         j = rng_init.randint(0, int(colunas * 0.3))
         if grade[i][j].tipo == TIPO_NORMAL and grade[i][j].estado_A == IGNORANTE:
             grade[i][j].estado_A = ESPALHADOR
             grade[i][j].mutacao_A = 1
-            alocados += 1
+            c += 1
 
-    alocados = 0
-    while alocados < n_por_news:
+    c = 0
+    while c < n_por_news:
         i = rng_init.randint(int(linhas * 0.7), linhas - 1)
         j = rng_init.randint(int(colunas * 0.7), colunas - 1)
         if grade[i][j].tipo == TIPO_NORMAL and grade[i][j].estado_B == IGNORANTE:
             grade[i][j].estado_B = ESPALHADOR
             grade[i][j].mutacao_B = 1
-            alocados += 1
+            c += 1
 
     return grade
 
 
 # ----------------------------------------------------------------------
-# Lógica pura da simulação (funções compartilhadas pelos workers)
+# Conversões grade <-> buffer plano (apenas na borda da simulação)
 # ----------------------------------------------------------------------
-def _avaliar_vizinhanca(grade, i, j, tipo_news):
-    linhas, colunas = len(grade), len(grade[0])
+def _grade_para_buffer(grade, buf_view, linhas, colunas):
+    for i in range(linhas):
+        linha = grade[i]
+        for j in range(colunas):
+            base = (i * colunas + j) * N_ATTRS
+            ind = linha[j]
+            buf_view[base + OFF_EST_A] = ind.estado_A
+            buf_view[base + OFF_MUT_A] = ind.mutacao_A
+            buf_view[base + OFF_EST_B] = ind.estado_B
+            buf_view[base + OFF_MUT_B] = ind.mutacao_B
+            buf_view[base + OFF_TIPO]  = ind.tipo
+
+
+def _buffer_para_grade(buf_view, linhas, colunas):
+    grade = []
+    for i in range(linhas):
+        linha = []
+        for j in range(colunas):
+            base = (i * colunas + j) * N_ATTRS
+            ind = Individuo()
+            ind.estado_A  = buf_view[base + OFF_EST_A]
+            ind.mutacao_A = buf_view[base + OFF_MUT_A]
+            ind.estado_B  = buf_view[base + OFF_EST_B]
+            ind.mutacao_B = buf_view[base + OFF_MUT_B]
+            ind.tipo      = buf_view[base + OFF_TIPO]
+            linha.append(ind)
+        grade.append(linha)
+    return grade
+
+
+# ----------------------------------------------------------------------
+# Globais do processo worker
+# ----------------------------------------------------------------------
+# Cada processo worker mantém uma referência aos dois shared_memory blocks
+# e as views correspondentes. Setadas pelo initializer do Pool.
+_w_shm_a = None
+_w_shm_b = None
+_w_view_a = None
+_w_view_b = None
+_w_linhas = 0
+_w_colunas = 0
+
+
+def _init_worker_processo(name_a, name_b, linhas, colunas):
+    """Initializer do Pool: cada processo abre as shared memories pelo nome."""
+    global _w_shm_a, _w_shm_b, _w_view_a, _w_view_b, _w_linhas, _w_colunas
+    _w_shm_a = shared_memory.SharedMemory(name=name_a)
+    _w_shm_b = shared_memory.SharedMemory(name=name_b)
+    _w_view_a = memoryview(_w_shm_a.buf).cast('i')   # int32
+    _w_view_b = memoryview(_w_shm_b.buf).cast('i')
+    _w_linhas = linhas
+    _w_colunas = colunas
+
+
+# ----------------------------------------------------------------------
+# Lógica de transição (operando diretamente sobre o buffer plano)
+# ----------------------------------------------------------------------
+def _avaliar_vizinhanca_buf(src, i, j, linhas, colunas, ler_estado_off, ler_mut_off):
+    """
+    Conta espalhadores e fact-checkers na vizinhança de Moore, lendo direto
+    do buffer plano. `ler_estado_off`/`ler_mut_off` selecionam A (0,1) ou B (2,3).
+    """
     n_esp = n_fact = soma_mut = 0
     for di in (-1, 0, 1):
         for dj in (-1, 0, 1):
@@ -197,16 +252,14 @@ def _avaliar_vizinhanca(grade, i, j, tipo_news):
             ni, nj = i + di, j + dj
             if not (0 <= ni < linhas and 0 <= nj < colunas):
                 continue
-            viz = grade[ni][nj]
-            if viz.tipo == TIPO_FACT_CHECKER:
+            nbase = (ni * colunas + nj) * N_ATTRS
+            n_tipo = src[nbase + OFF_TIPO]
+            if n_tipo == TIPO_FACT_CHECKER:
                 n_fact += 1
-            elif viz.tipo != TIPO_OBSTACULO:
-                if tipo_news == 'A' and viz.estado_A == ESPALHADOR:
+            elif n_tipo != TIPO_OBSTACULO:
+                if src[nbase + ler_estado_off] == ESPALHADOR:
                     n_esp += 1
-                    soma_mut += viz.mutacao_A
-                elif tipo_news == 'B' and viz.estado_B == ESPALHADOR:
-                    n_esp += 1
-                    soma_mut += viz.mutacao_B
+                    soma_mut += src[nbase + ler_mut_off]
     mut_media = (soma_mut // n_esp) if n_esp else 0
     return n_esp, mut_media, n_fact
 
@@ -227,68 +280,86 @@ def _calcular_transicao(n_viz, mut_media, n_fact, estado_conc, rng):
 
 
 # ----------------------------------------------------------------------
-# Workers de thread
+# Worker principal: processa linhas [i0, i1)
 # ----------------------------------------------------------------------
-# Cada worker recebe uma faixa exclusiva de linhas [i0, i1).
-#
 # Sem race condition:
-#   - Leitura: apenas de `grade` (snapshot imutável durante a geração)
-#   - Escrita: apenas em `nova_grade[i0..i1-1]` (fatia disjunta de cada thread)
-#   - RNG:    derivado de (semente, geração, i, j) - independente de qual
-#             thread executa
+#   - Leitura: apenas de `src` (buffer "atual" da geração)
+#   - Escrita: apenas em `dst[linhas i0..i1)`, faixa exclusiva deste processo
+#   - RNG: derivado de (semente, geração, i, j) - independente de quem processa
 # ----------------------------------------------------------------------
-def _worker_clonar(grade, nova_grade, i0, i1):
-    colunas = len(grade[0])
-    for i in range(i0, i1):
-        linha_origem = grade[i]
-        nova_grade[i] = [linha_origem[j].clonar() for j in range(colunas)]
+def _worker_proc(args):
+    i0, i1, semente, geracao, ler_de_a = args
 
+    src = _w_view_a if ler_de_a else _w_view_b
+    dst = _w_view_b if ler_de_a else _w_view_a
+    linhas, colunas = _w_linhas, _w_colunas
 
-def _worker_processar(grade, nova_grade, i0, i1, semente, geracao):
-    colunas = len(grade[0])
     for i in range(i0, i1):
         for j in range(colunas):
-            ind = grade[i][j]
-            novo = nova_grade[i][j]
+            base = (i * colunas + j) * N_ATTRS
 
-            if ind.tipo == TIPO_OBSTACULO or ind.tipo == TIPO_FACT_CHECKER:
-                continue
+            # Leitura
+            est_A = src[base + OFF_EST_A]
+            mut_A = src[base + OFF_MUT_A]
+            est_B = src[base + OFF_EST_B]
+            mut_B = src[base + OFF_MUT_B]
+            tipo  = src[base + OFF_TIPO]
 
-            rng = rng_celula(semente, geracao, i, j)
+            # Valores de saída (default = copiar)
+            n_est_A, n_mut_A = est_A, mut_A
+            n_est_B, n_mut_B = est_B, mut_B
+            n_tipo = tipo
 
-            viz_a, mut_a, cura = _avaliar_vizinhanca(grade, i, j, 'A')
+            if tipo != TIPO_OBSTACULO and tipo != TIPO_FACT_CHECKER:
+                rng = rng_celula(semente, geracao, i, j)
 
-            # Propagação orgânica de fact-checkers
-            if cura >= 1 and rng.random() < 0.02:
-                novo.tipo = TIPO_FACT_CHECKER
-                novo.estado_A = IGNORANTE
-                novo.estado_B = IGNORANTE
-                continue
-
-            viz_b, mut_b, _ = _avaliar_vizinhanca(grade, i, j, 'B')
-
-            # Transições estado A
-            if ind.estado_A == IGNORANTE:
-                novo.estado_A, novo.mutacao_A = _calcular_transicao(
-                    viz_a, mut_a, cura, ind.estado_B, rng
+                viz_a, mma, cura = _avaliar_vizinhanca_buf(
+                    src, i, j, linhas, colunas, OFF_EST_A, OFF_MUT_A
                 )
-            elif ind.estado_A == ESPALHADOR:
-                if rng.random() < (0.25 if cura > 0 else 0.5):
-                    novo.estado_A = INATIVO
 
-            # Transições estado B
-            if ind.estado_B == IGNORANTE:
-                novo.estado_B, novo.mutacao_B = _calcular_transicao(
-                    viz_b, mut_b, cura, ind.estado_A, rng
-                )
-            elif ind.estado_B == ESPALHADOR:
-                if rng.random() < (0.25 if cura > 0 else 0.5):
-                    novo.estado_B = INATIVO
+                converteu_em_fact = False
+                if cura >= 1 and rng.random() < 0.02:
+                    n_tipo = TIPO_FACT_CHECKER
+                    n_est_A = IGNORANTE
+                    n_mut_A = 0
+                    n_est_B = IGNORANTE
+                    n_mut_B = 0
+                    converteu_em_fact = True
+
+                if not converteu_em_fact:
+                    viz_b, mmb, _ = _avaliar_vizinhanca_buf(
+                        src, i, j, linhas, colunas, OFF_EST_B, OFF_MUT_B
+                    )
+
+                    # Transições estado A
+                    if est_A == IGNORANTE:
+                        n_est_A, n_mut_A = _calcular_transicao(viz_a, mma, cura, est_B, rng)
+                    elif est_A == ESPALHADOR:
+                        if rng.random() < (0.25 if cura > 0 else 0.5):
+                            n_est_A = INATIVO
+
+                    # Transições estado B
+                    if est_B == IGNORANTE:
+                        n_est_B, n_mut_B = _calcular_transicao(viz_b, mmb, cura, est_A, rng)
+                    elif est_B == ESPALHADOR:
+                        if rng.random() < (0.25 if cura > 0 else 0.5):
+                            n_est_B = INATIVO
+
+            # Escrita no buffer destino
+            dst[base + OFF_EST_A] = n_est_A
+            dst[base + OFF_MUT_A] = n_mut_A
+            dst[base + OFF_EST_B] = n_est_B
+            dst[base + OFF_MUT_B] = n_mut_B
+            dst[base + OFF_TIPO]  = n_tipo
 
 
-def _worker_visualizar(grade, matriz, i0, i1):
-    colunas = len(grade[0])
-    for i in range(i0, i1):
+# ----------------------------------------------------------------------
+# Visualização (idêntica às outras versões)
+# ----------------------------------------------------------------------
+def grade_para_matriz_visual(grade):
+    linhas, colunas = len(grade), len(grade[0])
+    matriz = [[0] * colunas for _ in range(linhas)]
+    for i in range(linhas):
         for j in range(colunas):
             ind = grade[i][j]
             if ind.tipo == TIPO_OBSTACULO:
@@ -304,48 +375,6 @@ def _worker_visualizar(grade, matriz, i0, i1):
                     matriz[i][j] = 2
                 elif a:
                     matriz[i][j] = 1
-
-
-# ----------------------------------------------------------------------
-# Próxima geração (paralela em duas fases)
-# ----------------------------------------------------------------------
-def proxima_geracao(grade, executor, num_threads, semente, geracao):
-    """
-    Calcula a próxima geração em duas fases paralelas:
-      Fase 1 - clonagem: cada thread copia sua fatia de grade -> nova_grade
-      Fase 2 - transições: cada thread aplica as regras em sua fatia
-
-    A barreira entre as fases (via .result()) garante snapshot consistente
-    antes das transições começarem.
-    """
-    linhas = len(grade)
-    nova_grade = [None] * linhas
-    fatias = list(_fatiar(linhas, num_threads))
-
-    # Fase 1: clonagem paralela
-    futuros = [executor.submit(_worker_clonar, grade, nova_grade, a, b)
-               for a, b in fatias]
-    for f in futuros:
-        f.result()
-
-    # Fase 2: transições paralelas
-    futuros = [executor.submit(_worker_processar, grade, nova_grade, a, b,
-                               semente, geracao)
-               for a, b in fatias]
-    for f in futuros:
-        f.result()
-
-    return nova_grade
-
-
-def grade_para_matriz_visual(grade, executor, num_threads):
-    """Conversão para matriz visual em paralelo."""
-    linhas, colunas = len(grade), len(grade[0])
-    matriz = [[0] * colunas for _ in range(linhas)]
-    futuros = [executor.submit(_worker_visualizar, grade, matriz, a, b)
-               for a, b in _fatiar(linhas, num_threads)]
-    for f in futuros:
-        f.result()
     return matriz
 
 
@@ -365,20 +394,19 @@ def contar_estados_visual(visual):
 # Execução principal
 # ----------------------------------------------------------------------
 def executar_simulacao(
-    linhas=100,
-    colunas=100,
-    geracoes=80,
+    linhas=400,
+    colunas=400,
+    geracoes=150,
     perc_espalhadores=0.02,
     perc_obstaculos=0.08,
     perc_cura=0.002,
     semente=15,
-    num_threads=None,
+    num_processos=None,
     modo_grafico=False,
     salvar_animacao=None,
-    coletar_historico=True,
 ):
-    if num_threads is None:
-        num_threads = os.cpu_count() or 4
+    if num_processos is None:
+        num_processos = os.cpu_count() or 4
 
     grade = criar_grade(
         linhas, colunas,
@@ -388,50 +416,86 @@ def executar_simulacao(
         semente=semente,
     )
 
-    # Pool criado uma única vez: as threads ficam ativas durante todas as
-    # gerações, eliminando o custo de spawn/join por geração.
-    with ThreadPoolExecutor(max_workers=num_threads) as executor:
-        if modo_grafico:
-            return _executar_grafico(
-                grade, geracoes, semente, linhas, colunas,
-                executor, num_threads, salvar_animacao,
+    # Aloca dois blocos de shared memory: buffers A e B
+    # A cada geração, workers leem de um e escrevem no outro (alternância).
+    tamanho_bytes = linhas * colunas * N_ATTRS * 4   # int32 = 4 bytes
+    shm_a = shared_memory.SharedMemory(create=True, size=tamanho_bytes)
+    shm_b = shared_memory.SharedMemory(create=True, size=tamanho_bytes)
+
+    try:
+        view_a = memoryview(shm_a.buf).cast('i')
+        view_b = memoryview(shm_b.buf).cast('i')
+
+        # Estado inicial: A
+        _grade_para_buffer(grade, view_a, linhas, colunas)
+        # Zera B para evitar lixo (não estritamente necessário, mas limpo)
+        for k in range(linhas * colunas * N_ATTRS):
+            view_b[k] = 0
+
+        # Pool com initializer que abre as shared memories em cada worker
+        with mp.Pool(
+            processes=num_processos,
+            initializer=_init_worker_processo,
+            initargs=(shm_a.name, shm_b.name, linhas, colunas),
+        ) as pool:
+            fatias = list(_fatiar(linhas, num_processos))
+
+            if modo_grafico:
+                return _executar_grafico(
+                    pool, fatias, view_a, view_b,
+                    linhas, colunas, geracoes, semente,
+                    num_processos, salvar_animacao,
+                )
+            return _executar_headless(
+                pool, fatias, view_a, view_b,
+                linhas, colunas, geracoes, semente,
+                num_processos,
             )
-        return _executar_headless(
-            grade, geracoes, semente, linhas, colunas,
-            executor, num_threads, coletar_historico,
-        )
+
+    finally:
+        # Liberação obrigatória (especialmente importante no Windows)
+        # Soltar views antes para evitar 'cannot close exported pointers exist'
+        try: del view_a
+        except Exception: pass
+        try: del view_b
+        except Exception: pass
+        shm_a.close()
+        shm_b.close()
+        shm_a.unlink()
+        shm_b.unlink()
 
 
-def _executar_headless(grade, geracoes, semente, linhas, colunas,
-                       executor, num_threads, coletar_historico):
-    print(f"\n[MODO HEADLESS - PARALELO] Benchmark CPU ({linhas}x{colunas}) - {geracoes} gerações | {num_threads} threads")
+def _executar_headless(pool, fatias, view_a, view_b,
+                       linhas, colunas, geracoes, semente, num_processos):
+    print(f"\n[MODO HEADLESS - MULTIPROCESSING] Benchmark CPU ({linhas}x{colunas}) - {geracoes} gerações | {num_processos} processos")
 
-    historico = []
     tracemalloc.start()
     tempo_inicio = time.perf_counter()
 
+    ler_de_a = True
     for g in range(geracoes):
-        grade = proxima_geracao(grade, executor, num_threads, semente, g)
-        if coletar_historico:
-            historico.append(contar_estados_visual(
-                grade_para_matriz_visual(grade, executor, num_threads)
-            ))
+        tarefas = [(i0, i1, semente, g, ler_de_a) for i0, i1 in fatias]
+        # map (não imap) bloqueia até todas terminarem -> barreira natural
+        pool.map(_worker_proc, tarefas)
+        ler_de_a = not ler_de_a
 
     tempo_fim = time.perf_counter()
     _, pico_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    visual = grade_para_matriz_visual(grade, executor, num_threads)
+    # Reconstrói a grade final a partir do buffer "atual"
+    view_final = view_a if ler_de_a else view_b
+    grade_final = _buffer_para_grade(view_final, linhas, colunas)
+    visual = grade_para_matriz_visual(grade_final)
     estatisticas = contar_estados_visual(visual)
     tempo_total = tempo_fim - tempo_inicio
 
-    # Saída no mesmo formato da versão sequencial, para facilitar comparação
-    # direta no PDF.
+    # Saída no mesmo formato das outras versões
     print("-" * 40)
     print(" RESULTADOS DO BENCHMARK ")
     print("-" * 40)
-    print(f"Tempo Paralelo Puro  : {tempo_total:.4f} segundos")
-    print(f"Threads Utilizadas   : {num_threads}")
+    print(f"Tempo Multiproc. Puro: {tempo_total:.4f} segundos")
+    print(f"Processos Utilizados : {num_processos}")
     print(f"Pico de RAM (alocada): {pico_bytes / (1024 * 1024):.2f} MB")
     print("Distribuição Final:")
     print(f"  - Ignorantes        : {estatisticas['ignorantes']}")
@@ -444,37 +508,38 @@ def _executar_headless(grade, geracoes, semente, linhas, colunas,
 
     return {
         'tempo_segundos': tempo_total,
-        'num_threads': num_threads,
+        'num_processos': num_processos,
         'pico_ram_mb': pico_bytes / (1024 * 1024),
         'estatisticas_finais': estatisticas,
-        'historico': historico,
-        'grade_final': grade,
+        'grade_final': grade_final,
     }
 
 
-def _executar_grafico(grade, geracoes, semente, linhas, colunas,
-                      executor, num_threads, salvar_animacao):
-    print(f"\n[MODO GRÁFICO - PARALELO] Renderizando ({linhas}x{colunas}) - {geracoes} gerações | {num_threads} threads...")
+def _executar_grafico(pool, fatias, view_a, view_b,
+                      linhas, colunas, geracoes, semente,
+                      num_processos, salvar_animacao):
+    print(f"\n[MODO GRÁFICO - MULTIPROCESSING] Renderizando ({linhas}x{colunas}) - {geracoes} gerações | {num_processos} processos...")
     tempo_inicio = time.perf_counter()
 
-    estado_visual = grade_para_matriz_visual(grade, executor, num_threads)
+    estado = {'g': 0, 'ler_de_a': True}
+
+    grade_atual = _buffer_para_grade(view_a, linhas, colunas)
+    vis = grade_para_matriz_visual(grade_atual)
     fig, ax = plt.subplots(figsize=(8, 8))
-    matriz_plot = ax.imshow(estado_visual, cmap=MAPA_CORES, vmin=0, vmax=5)
+    matriz_plot = ax.imshow(vis, cmap=MAPA_CORES, vmin=0, vmax=5)
     ax.axis('off')
 
-    estado = {'geracao_atual': 0, 'grade_atual': grade}
-
     def atualizar_frame(_frame):
-        if estado['geracao_atual'] < geracoes:
-            estado['grade_atual'] = proxima_geracao(
-                estado['grade_atual'], executor, num_threads,
-                semente, estado['geracao_atual'],
-            )
-            estado['geracao_atual'] += 1
-            matriz_plot.set_data(grade_para_matriz_visual(
-                estado['grade_atual'], executor, num_threads
-            ))
-            ax.set_title(f"Geração {estado['geracao_atual']}/{geracoes}")
+        if estado['g'] < geracoes:
+            tarefas = [(i0, i1, semente, estado['g'], estado['ler_de_a'])
+                       for i0, i1 in fatias]
+            pool.map(_worker_proc, tarefas)
+            estado['ler_de_a'] = not estado['ler_de_a']
+            estado['g'] += 1
+            view_atual = view_a if estado['ler_de_a'] else view_b
+            grade_atual = _buffer_para_grade(view_atual, linhas, colunas)
+            matriz_plot.set_data(grade_para_matriz_visual(grade_atual))
+            ax.set_title(f"Geração {estado['g']}/{geracoes}")
         return [matriz_plot]
 
     anim = animation.FuncAnimation(
@@ -506,29 +571,33 @@ def _executar_grafico(grade, geracoes, semente, linhas, colunas,
 # Entry point
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    N = os.cpu_count() or 4
-    gerar_relatorio_ambiente(num_threads=N)
+    # IMPORTANTE no Windows: o guard __main__ é obrigatório para
+    # multiprocessing com spawn (que é o default no Windows).
+    mp.freeze_support()
 
-    # Mesma carga do sequencial -> resultados diretamente comparáveis no PDF.
+    N = os.cpu_count() or 4
+    gerar_relatorio_ambiente(num_processos=N)
+
+    # Mesma carga das outras versões - resultados diretamente comparáveis no PDF
     resultado = executar_simulacao(
-        linhas=350,
-        colunas=350,
+        linhas=400,
+        colunas=400,
         geracoes=150,
-        num_threads=N,
+        num_processos=N,
         modo_grafico=False,
     )
 
-    # Animação para a apresentação
+    # Animação para apresentação
     if em_jupyter():
         from IPython.display import display
         anim = executar_simulacao(
-            linhas=150, colunas=150, geracoes=100,
-            num_threads=N, modo_grafico=True,
+            linhas=400, colunas=400, geracoes=150,
+            num_processos=N, modo_grafico=True,
         )
         display(anim)
     else:
         executar_simulacao(
-            linhas=150, colunas=150, geracoes=100,
-            num_threads=N, modo_grafico=True,
-            salvar_animacao='propagacao_paralelo.gif',
+            linhas=400, colunas=400, geracoes=150,
+            num_processos=N, modo_grafico=True,
+            salvar_animacao='propagacao_multiprocessing.gif',
         )
