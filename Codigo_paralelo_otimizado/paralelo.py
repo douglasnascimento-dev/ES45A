@@ -1,32 +1,8 @@
 """
-Simulação com Multiprocessing de Propagação de Fake News
----------------------------------------------------------
+Simulação Paralela de Propagação de Fake News - Multiprocessing.
 
-Implementação adicional (proposta como MELHORIA/INOVAÇÃO):
-comparação de paradigmas paralelos - threads vs processos em CPython.
-
-Por que esta versão existe:
-    A versão paralela com Threads é limitada pelo GIL do CPython - o
-    bytecode Python é serializado mesmo com múltiplas threads. Esta
-    versão usa multiprocessing.shared_memory para contornar o GIL
-    completamente, com cada processo executando em paralelo real.
-
-Diferenças técnicas em relação à versão com threads:
-    - Cada worker é um processo independente, sem GIL compartilhado.
-    - Comunicação via memória compartilhada (shared_memory) com dois
-      buffers que alternam papel de leitura/escrita a cada geração.
-      Custo de comunicação ~zero por geração (sem serialização).
-    - Grade representada internamente como buffer plano de inteiros
-      (5 atributos por célula), ao invés de objetos Individuo.
-
-Garantias preservadas:
-    - Determinismo: mesma semente -> mesmo resultado da versão
-      sequencial, independente do número de processos.
-      (RNG derivado por célula: rng_celula(semente, g, i, j))
-    - Sem race condition: workers escrevem em faixas exclusivas de
-      linhas do buffer de destino. Sem locks.
-    - Paralelização explícita: divisão de carga manual por faixas
-      de linhas, sem uso de bibliotecas de paralelização automática.
+Usa multiprocessing.shared_memory para que os processos compartilhem
+a grade sem precisar serializar a cada geração.
 """
 
 import random
@@ -41,38 +17,38 @@ from multiprocessing import shared_memory
 try:
     import psutil
 except ImportError:
-    print("Aviso: 'psutil' não instalado. Métricas de hardware ficarão limitadas.")
+    print("Aviso: 'psutil' não instalado.")
     psutil = None
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import matplotlib.animation as animation
 
-# ----------------------------------------------------------------------
-# Constantes
-# ----------------------------------------------------------------------
+# Estados de cada notícia
 IGNORANTE = 0
 ESPALHADOR = 1
 INATIVO = 2
 
+# Tipos de célula
 TIPO_NORMAL = 0
 TIPO_OBSTACULO = 1
 TIPO_FACT_CHECKER = 2
 
-# Layout da célula no buffer plano: 5 inteiros consecutivos
-OFF_EST_A = 0   # estado_A
-OFF_MUT_A = 1   # mutacao_A
-OFF_EST_B = 2   # estado_B
-OFF_MUT_B = 3   # mutacao_B
-OFF_TIPO  = 4   # tipo
+# Posições dos 5 atributos da célula dentro do buffer plano
+OFF_EST_A = 0
+OFF_MUT_A = 1
+OFF_EST_B = 2
+OFF_MUT_B = 3
+OFF_TIPO  = 4
 N_ATTRS   = 5
 
 MAPA_CORES = ListedColormap(
     ['#FFFFFF', '#E63946', '#457B9D', '#7209B7', '#4A4A4A', '#007504']
 )
 
+
 # ----------------------------------------------------------------------
-# RNG determinístico por célula (mesmo do sequencial)
+# RNG por célula - garante que paralelo e sequencial deem o mesmo resultado
 # ----------------------------------------------------------------------
 _MASK64 = 0xFFFFFFFFFFFFFFFF
 
@@ -87,7 +63,7 @@ def rng_celula(semente, geracao, i, j):
 
 
 # ----------------------------------------------------------------------
-# Classe Individuo (mantida para API e comparabilidade com outras versões)
+# Classe do indivíduo (slots para economizar RAM)
 # ----------------------------------------------------------------------
 class Individuo:
     __slots__ = ['estado_A', 'mutacao_A', 'estado_B', 'mutacao_B', 'tipo']
@@ -101,7 +77,7 @@ class Individuo:
 
 
 # ----------------------------------------------------------------------
-# Ambiente
+# Funções utilitárias do ambiente
 # ----------------------------------------------------------------------
 def em_jupyter():
     try:
@@ -130,7 +106,7 @@ def gerar_relatorio_ambiente(num_processos=0):
 
 
 # ----------------------------------------------------------------------
-# Divisão de carga
+# Divide [0, total) em n faixas (uma por worker)
 # ----------------------------------------------------------------------
 def _fatiar(total, n):
     base, extra = divmod(total, n)
@@ -143,7 +119,7 @@ def _fatiar(total, n):
 
 
 # ----------------------------------------------------------------------
-# Criação da grade inicial (idêntica ao sequencial - garante reprodutibilidade)
+# Cria a grade inicial. Mesma lógica do sequencial.
 # ----------------------------------------------------------------------
 def criar_grade(linhas, colunas, perc_espalhadores=0.02,
                 perc_obstaculos=0.08, perc_cura=0.002, semente=15):
@@ -151,6 +127,7 @@ def criar_grade(linhas, colunas, perc_espalhadores=0.02,
     grade = [[Individuo() for _ in range(colunas)] for _ in range(linhas)]
     total = linhas * colunas
 
+    # Posiciona obstáculos e fact-checkers aleatórios
     for _ in range(int(total * perc_obstaculos)):
         grade[rng_init.randint(0, linhas - 1)][rng_init.randint(0, colunas - 1)].tipo = TIPO_OBSTACULO
     for _ in range(int(total * perc_cura)):
@@ -158,6 +135,7 @@ def criar_grade(linhas, colunas, perc_espalhadores=0.02,
 
     n_por_news = int((total * perc_espalhadores) / 2)
 
+    # Fake news A começa no canto superior esquerdo
     c = 0
     while c < n_por_news:
         i = rng_init.randint(0, int(linhas * 0.3))
@@ -167,6 +145,7 @@ def criar_grade(linhas, colunas, perc_espalhadores=0.02,
             grade[i][j].mutacao_A = 1
             c += 1
 
+    # Fake news B começa no canto inferior direito
     c = 0
     while c < n_por_news:
         i = rng_init.randint(int(linhas * 0.7), linhas - 1)
@@ -180,7 +159,7 @@ def criar_grade(linhas, colunas, perc_espalhadores=0.02,
 
 
 # ----------------------------------------------------------------------
-# Conversões grade <-> buffer plano (apenas na borda da simulação)
+# Conversões entre grade (objetos) e buffer plano de ints
 # ----------------------------------------------------------------------
 def _grade_para_buffer(grade, buf_view, linhas, colunas):
     for i in range(linhas):
@@ -213,10 +192,8 @@ def _buffer_para_grade(buf_view, linhas, colunas):
 
 
 # ----------------------------------------------------------------------
-# Globais do processo worker
+# Variáveis globais dos workers - preenchidas pelo initializer do Pool
 # ----------------------------------------------------------------------
-# Cada processo worker mantém uma referência aos dois shared_memory blocks
-# e as views correspondentes. Setadas pelo initializer do Pool.
 _w_shm_a = None
 _w_shm_b = None
 _w_view_a = None
@@ -226,24 +203,20 @@ _w_colunas = 0
 
 
 def _init_worker_processo(name_a, name_b, linhas, colunas):
-    """Initializer do Pool: cada processo abre as shared memories pelo nome."""
+    """Roda uma vez em cada processo, abre as shared memories pelo nome."""
     global _w_shm_a, _w_shm_b, _w_view_a, _w_view_b, _w_linhas, _w_colunas
     _w_shm_a = shared_memory.SharedMemory(name=name_a)
     _w_shm_b = shared_memory.SharedMemory(name=name_b)
-    _w_view_a = memoryview(_w_shm_a.buf).cast('i')   # int32
+    _w_view_a = memoryview(_w_shm_a.buf).cast('i')
     _w_view_b = memoryview(_w_shm_b.buf).cast('i')
     _w_linhas = linhas
     _w_colunas = colunas
 
 
 # ----------------------------------------------------------------------
-# Lógica de transição (operando diretamente sobre o buffer plano)
+# Vizinhança de Moore lendo direto do buffer
 # ----------------------------------------------------------------------
 def _avaliar_vizinhanca_buf(src, i, j, linhas, colunas, ler_estado_off, ler_mut_off):
-    """
-    Conta espalhadores e fact-checkers na vizinhança de Moore, lendo direto
-    do buffer plano. `ler_estado_off`/`ler_mut_off` selecionam A (0,1) ou B (2,3).
-    """
     n_esp = n_fact = soma_mut = 0
     for di in (-1, 0, 1):
         for dj in (-1, 0, 1):
@@ -264,32 +237,37 @@ def _avaliar_vizinhanca_buf(src, i, j, linhas, colunas, ler_estado_off, ler_mut_
     return n_esp, mut_media, n_fact
 
 
+# ----------------------------------------------------------------------
+# Decide se um ignorante vira espalhador
+# ----------------------------------------------------------------------
 def _calcular_transicao(n_viz, mut_media, n_fact, estado_conc, rng):
     if n_fact > 0:
         return IGNORANTE, 0
+
     limiar = 1.75
+    # Mutação alta facilita o convencimento
     if mut_media >= 3:
         limiar -= 1.0
     if mut_media >= 6:
         limiar -= 2.0
+    # Resistência cruzada: já infectado pela outra news dificulta
     if estado_conc != IGNORANTE:
         limiar += 3.0
+
     if n_viz >= max(1, limiar) and rng.random() < 0.65:
         return ESPALHADOR, mut_media + 1
+
     return IGNORANTE, 0
 
 
 # ----------------------------------------------------------------------
-# Worker principal: processa linhas [i0, i1)
-# ----------------------------------------------------------------------
-# Sem race condition:
-#   - Leitura: apenas de `src` (buffer "atual" da geração)
-#   - Escrita: apenas em `dst[linhas i0..i1)`, faixa exclusiva deste processo
-#   - RNG: derivado de (semente, geração, i, j) - independente de quem processa
+# Processa um bloco de linhas [i0, i1). Roda em cada processo do Pool.
+# Sem race condition: cada worker escreve só na sua faixa de dst.
 # ----------------------------------------------------------------------
 def _worker_proc(args):
     i0, i1, semente, geracao, ler_de_a = args
 
+    # Alterna qual buffer é leitura e qual é escrita a cada geração
     src = _w_view_a if ler_de_a else _w_view_b
     dst = _w_view_b if ler_de_a else _w_view_a
     linhas, colunas = _w_linhas, _w_colunas
@@ -298,18 +276,18 @@ def _worker_proc(args):
         for j in range(colunas):
             base = (i * colunas + j) * N_ATTRS
 
-            # Leitura
             est_A = src[base + OFF_EST_A]
             mut_A = src[base + OFF_MUT_A]
             est_B = src[base + OFF_EST_B]
             mut_B = src[base + OFF_MUT_B]
             tipo  = src[base + OFF_TIPO]
 
-            # Valores de saída (default = copiar)
+            # Default: copia o estado atual
             n_est_A, n_mut_A = est_A, mut_A
             n_est_B, n_mut_B = est_B, mut_B
             n_tipo = tipo
 
+            # Obstáculos e fact-checkers não evoluem
             if tipo != TIPO_OBSTACULO and tipo != TIPO_FACT_CHECKER:
                 rng = rng_celula(semente, geracao, i, j)
 
@@ -317,6 +295,7 @@ def _worker_proc(args):
                     src, i, j, linhas, colunas, OFF_EST_A, OFF_MUT_A
                 )
 
+                # Contágio orgânico de fact-checking (2% por vizinho curador)
                 converteu_em_fact = False
                 if cura >= 1 and rng.random() < 0.02:
                     n_tipo = TIPO_FACT_CHECKER
@@ -331,21 +310,22 @@ def _worker_proc(args):
                         src, i, j, linhas, colunas, OFF_EST_B, OFF_MUT_B
                     )
 
-                    # Transições estado A
+                    # Transições da fake news A
                     if est_A == IGNORANTE:
                         n_est_A, n_mut_A = _calcular_transicao(viz_a, mma, cura, est_B, rng)
                     elif est_A == ESPALHADOR:
+                        # Espalhador vira inativo (mais rápido perto de fact-checker)
                         if rng.random() < (0.25 if cura > 0 else 0.5):
                             n_est_A = INATIVO
 
-                    # Transições estado B
+                    # Transições da fake news B
                     if est_B == IGNORANTE:
                         n_est_B, n_mut_B = _calcular_transicao(viz_b, mmb, cura, est_A, rng)
                     elif est_B == ESPALHADOR:
                         if rng.random() < (0.25 if cura > 0 else 0.5):
                             n_est_B = INATIVO
 
-            # Escrita no buffer destino
+            # Escreve no buffer de destino
             dst[base + OFF_EST_A] = n_est_A
             dst[base + OFF_MUT_A] = n_mut_A
             dst[base + OFF_EST_B] = n_est_B
@@ -354,7 +334,7 @@ def _worker_proc(args):
 
 
 # ----------------------------------------------------------------------
-# Visualização (idêntica às outras versões)
+# Converte a grade em matriz de ints 0-5 para a visualização
 # ----------------------------------------------------------------------
 def grade_para_matriz_visual(grade):
     linhas, colunas = len(grade), len(grade[0])
@@ -391,7 +371,7 @@ def contar_estados_visual(visual):
 
 
 # ----------------------------------------------------------------------
-# Execução principal
+# Função principal - configura o Pool e dispara headless ou gráfico
 # ----------------------------------------------------------------------
 def executar_simulacao(
     linhas=400,
@@ -416,8 +396,7 @@ def executar_simulacao(
         semente=semente,
     )
 
-    # Aloca dois blocos de shared memory: buffers A e B
-    # A cada geração, workers leem de um e escrevem no outro (alternância).
+    # Aloca os dois buffers compartilhados (ping-pong)
     tamanho_bytes = linhas * colunas * N_ATTRS * 4   # int32 = 4 bytes
     shm_a = shared_memory.SharedMemory(create=True, size=tamanho_bytes)
     shm_b = shared_memory.SharedMemory(create=True, size=tamanho_bytes)
@@ -426,13 +405,13 @@ def executar_simulacao(
         view_a = memoryview(shm_a.buf).cast('i')
         view_b = memoryview(shm_b.buf).cast('i')
 
-        # Estado inicial: A
+        # Copia o estado inicial para o buffer A
         _grade_para_buffer(grade, view_a, linhas, colunas)
-        # Zera B para evitar lixo (não estritamente necessário, mas limpo)
+        # Zera o buffer B
         for k in range(linhas * colunas * N_ATTRS):
             view_b[k] = 0
 
-        # Pool com initializer que abre as shared memories em cada worker
+        # Cria o Pool e passa os nomes das shared memories pelo initializer
         with mp.Pool(
             processes=num_processos,
             initializer=_init_worker_processo,
@@ -453,8 +432,7 @@ def executar_simulacao(
             )
 
     finally:
-        # Liberação obrigatória (especialmente importante no Windows)
-        # Soltar views antes para evitar 'cannot close exported pointers exist'
+        # Libera as views antes de fechar (evita erro no Windows)
         try: del view_a
         except Exception: pass
         try: del view_b
@@ -465,6 +443,9 @@ def executar_simulacao(
         shm_b.unlink()
 
 
+# ----------------------------------------------------------------------
+# Modo headless - benchmark puro, sem renderização
+# ----------------------------------------------------------------------
 def _executar_headless(pool, fatias, view_a, view_b,
                        linhas, colunas, geracoes, semente, num_processos):
     print(f"\n[MODO HEADLESS - MULTIPROCESSING] Benchmark CPU ({linhas}x{colunas}) - {geracoes} gerações | {num_processos} processos")
@@ -472,10 +453,11 @@ def _executar_headless(pool, fatias, view_a, view_b,
     tracemalloc.start()
     tempo_inicio = time.perf_counter()
 
+    # Loop principal: alterna o sentido leitura/escrita a cada geração
     ler_de_a = True
     for g in range(geracoes):
         tarefas = [(i0, i1, semente, g, ler_de_a) for i0, i1 in fatias]
-        # map (não imap) bloqueia até todas terminarem -> barreira natural
+        # pool.map bloqueia até todos terminarem -> barreira natural
         pool.map(_worker_proc, tarefas)
         ler_de_a = not ler_de_a
 
@@ -483,14 +465,13 @@ def _executar_headless(pool, fatias, view_a, view_b,
     _, pico_bytes = tracemalloc.get_traced_memory()
     tracemalloc.stop()
 
-    # Reconstrói a grade final a partir do buffer "atual"
+    # Reconstrói a grade final a partir do buffer atual
     view_final = view_a if ler_de_a else view_b
     grade_final = _buffer_para_grade(view_final, linhas, colunas)
     visual = grade_para_matriz_visual(grade_final)
     estatisticas = contar_estados_visual(visual)
     tempo_total = tempo_fim - tempo_inicio
 
-    # Saída no mesmo formato das outras versões
     print("-" * 40)
     print(" RESULTADOS DO BENCHMARK ")
     print("-" * 40)
@@ -515,6 +496,9 @@ def _executar_headless(pool, fatias, view_a, view_b,
     }
 
 
+# ----------------------------------------------------------------------
+# Modo gráfico - gera GIF/MP4 ou janela com a animação
+# ----------------------------------------------------------------------
 def _executar_grafico(pool, fatias, view_a, view_b,
                       linhas, colunas, geracoes, semente,
                       num_processos, salvar_animacao):
@@ -571,14 +555,13 @@ def _executar_grafico(pool, fatias, view_a, view_b,
 # Entry point
 # ----------------------------------------------------------------------
 if __name__ == "__main__":
-    # IMPORTANTE no Windows: o guard __main__ é obrigatório para
-    # multiprocessing com spawn (que é o default no Windows).
+    # No Windows o guard __main__ é obrigatório para multiprocessing (spawn)
     mp.freeze_support()
 
     N = os.cpu_count() or 4
     gerar_relatorio_ambiente(num_processos=N)
 
-    # Mesma carga das outras versões - resultados diretamente comparáveis no PDF
+    # Benchmark
     resultado = executar_simulacao(
         linhas=400,
         colunas=400,
@@ -587,7 +570,7 @@ if __name__ == "__main__":
         modo_grafico=False,
     )
 
-    # Animação para apresentação
+    # Animação
     if em_jupyter():
         from IPython.display import display
         anim = executar_simulacao(
