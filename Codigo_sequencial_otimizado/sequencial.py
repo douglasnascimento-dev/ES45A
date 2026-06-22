@@ -1,27 +1,7 @@
 """
-Simulação Sequencial de Propagação de Fake News
--------------------------------------------------
+Simulação Sequencial de Propagação de Fake News.
 
-Versão sequencial estendida, base para as versões Paralela (Threads) e
-Distribuída (Sockets/RMI).
-
-Estados base por indivíduo (por fake news A e B):
-    0 = Ignorante
-    1 = Espalhador
-    2 = Inativo
-
-Tipos de célula:
-    NORMAL        = indivíduo comum, sujeito a propagação
-    OBSTACULO     = célula morta (não processa, gera desbalanceamento real)
-    FACT_CHECKER  = "agente da cura", neutraliza propagação na vizinhança
-
-Decisões importantes desta versão:
-    - RNG determinístico por célula/geração: garante que paralela e
-      distribuída produzam EXATAMENTE o mesmo resultado do sequencial
-      para a mesma semente.
-    - Medição de pico real de RAM via tracemalloc.
-    - Modo gráfico tolerante a ambiente (Jupyter ou script .py).
-    - Histórico por geração disponível para análise/plot posterior.
+Versão base. Serve de referência para as versões paralela e distribuída.
 """
 
 import random
@@ -34,20 +14,19 @@ import tracemalloc
 try:
     import psutil
 except ImportError:
-    print("Aviso: 'psutil' não instalado. Métricas de hardware ficarão limitadas.")
+    print("Aviso: 'psutil' não instalado.")
     psutil = None
 
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
 import matplotlib.animation as animation
 
-# ----------------------------------------------------------------------
-# Constantes de estado e tipo
-# ----------------------------------------------------------------------
+# Estados de cada notícia
 IGNORANTE = 0
 ESPALHADOR = 1
 INATIVO = 2
 
+# Tipos de célula
 TIPO_NORMAL = 0
 TIPO_OBSTACULO = 1
 TIPO_FACT_CHECKER = 2
@@ -58,27 +37,11 @@ MAPA_CORES = ListedColormap(
 
 
 # ----------------------------------------------------------------------
-# RNG determinístico por célula
-# ----------------------------------------------------------------------
-# Por que isso é necessário:
-# Como introduzimos transições estocásticas (random.random() < p), se
-# usarmos o RNG global do módulo `random`, a ordem de consumo do RNG
-# muda quando paralelizamos (threads diferentes consomem em ordem
-# imprevisível). Isso faria a versão paralela divergir do sequencial.
-#
-# Usando uma semente derivada determinística (semente_global, geração,
-# i, j), cada célula tem seu próprio fluxo aleatório, INDEPENDENTE da
-# ordem em que é processada. Resultado: paralela e distribuída produzem
-# bit-a-bit o mesmo resultado do sequencial para a mesma semente.
-#
-# Importante: não usamos hash() do Python porque o PYTHONHASHSEED
-# aleatoriza hashes de strings/tuplas entre execuções. Usamos mistura
-# aritmética com primos grandes (estável entre processos e máquinas).
+# RNG por célula - garante que paralelo e sequencial deem o mesmo resultado
 # ----------------------------------------------------------------------
 _MASK64 = 0xFFFFFFFFFFFFFFFF
 
 def rng_celula(semente, geracao, i, j):
-    """Retorna um random.Random determinístico para a célula (i,j) na geração dada."""
     s = (
         (semente * 0x9E3779B97F4A7C15)
         ^ (geracao * 0xBF58476D1CE4E5B9)
@@ -89,22 +52,9 @@ def rng_celula(semente, geracao, i, j):
 
 
 # ----------------------------------------------------------------------
-# Classe Indivíduo
+# Classe do indivíduo (slots para economizar RAM)
 # ----------------------------------------------------------------------
 class Individuo:
-    """
-    MELHORIA 1: Otimização Computacional (__slots__).
-    Sem __dict__ por instância: economiza RAM e acelera acesso a
-    atributos em grades extensas.
-
-    MELHORIA 2: Múltiplas Fake News Simultâneas (A e B).
-    Cada indivíduo carrega dois estados independentes, transformando
-    a matriz em arena de colisão entre narrativas.
-
-    MELHORIA 3: Mutação da Informação.
-    Cada notícia carrega uma "força" (mutacao_X) que evolui ao longo
-    das gerações e altera o poder de convencimento.
-    """
     __slots__ = ['estado_A', 'mutacao_A', 'estado_B', 'mutacao_B', 'tipo']
 
     def __init__(self):
@@ -125,23 +75,20 @@ class Individuo:
 
 
 # ----------------------------------------------------------------------
-# Ambiente / Relatório
+# Funções utilitárias do ambiente
 # ----------------------------------------------------------------------
 def em_jupyter():
-    """Detecta se estamos rodando em um kernel Jupyter/IPython."""
     try:
         from IPython import get_ipython
         ip = get_ipython()
         if ip is None:
             return False
-        # 'ZMQInteractiveShell' = Jupyter; 'TerminalInteractiveShell' = ipython no terminal
         return ip.__class__.__name__ == 'ZMQInteractiveShell'
     except Exception:
         return False
 
 
 def gerar_relatorio_ambiente():
-    """MELHORIA 4: coleta automática do hardware para o relatório experimental."""
     print("=" * 60)
     print(" CONFIGURAÇÃO EXPERIMENTAL - AMBIENTE DE EXECUÇÃO ")
     print("=" * 60)
@@ -159,7 +106,7 @@ def gerar_relatorio_ambiente():
 
 
 # ----------------------------------------------------------------------
-# Criação da grade inicial
+# Cria a grade inicial
 # ----------------------------------------------------------------------
 def criar_grade(
     linhas,
@@ -169,28 +116,21 @@ def criar_grade(
     perc_cura=0.002,
     semente=15,
 ):
-    """
-    Cria a matriz inicial.
-
-    MELHORIA 5: Injeção de obstáculos (células mortas) -> força
-    desbalanceamento real de carga, motivando balanceamento dinâmico
-    na versão paralela/distribuída.
-    """
-    rng_init = random.Random(semente)  # RNG isolado, não polui o estado global
+    # RNG isolado para não poluir o estado global do módulo random
+    rng_init = random.Random(semente)
     grade = [[Individuo() for _ in range(colunas)] for _ in range(linhas)]
     total_celulas = linhas * colunas
 
-    # Obstáculos
+    # Posiciona obstáculos e fact-checkers aleatórios
     for _ in range(int(total_celulas * perc_obstaculos)):
         grade[rng_init.randint(0, linhas - 1)][rng_init.randint(0, colunas - 1)].tipo = TIPO_OBSTACULO
 
-    # Fact-checkers iniciais
     for _ in range(int(total_celulas * perc_cura)):
         grade[rng_init.randint(0, linhas - 1)][rng_init.randint(0, colunas - 1)].tipo = TIPO_FACT_CHECKER
 
     total_espalhadores_por_news = int((total_celulas * perc_espalhadores) / 2)
 
-    # Espalhadores da Fake News A no canto superior esquerdo
+    # Fake news A começa no canto superior esquerdo
     alocados_A = 0
     while alocados_A < total_espalhadores_por_news:
         i = rng_init.randint(0, int(linhas * 0.3))
@@ -200,7 +140,7 @@ def criar_grade(
             grade[i][j].mutacao_A = 1
             alocados_A += 1
 
-    # Espalhadores da Fake News B no canto inferior direito
+    # Fake news B começa no canto inferior direito
     alocados_B = 0
     while alocados_B < total_espalhadores_por_news:
         i = rng_init.randint(int(linhas * 0.7), linhas - 1)
@@ -214,10 +154,9 @@ def criar_grade(
 
 
 # ----------------------------------------------------------------------
-# Lógica de simulação
+# Vizinhança de Moore: conta espalhadores e fact-checkers ao redor
 # ----------------------------------------------------------------------
 def avaliar_vizinhanca(grade, i, j, tipo_news):
-    """Conta espalhadores, agrega mutação média e detecta fact-checkers na vizinhança de Moore."""
     linhas, colunas = len(grade), len(grade[0])
     qtd_espalhadores, soma_mutacao, qtd_fact_checkers = 0, 0, 0
 
@@ -244,24 +183,20 @@ def avaliar_vizinhanca(grade, i, j, tipo_news):
     return qtd_espalhadores, mutacao_media, qtd_fact_checkers
 
 
+# ----------------------------------------------------------------------
+# Decide se um ignorante vira espalhador
+# ----------------------------------------------------------------------
 def calcular_transicao(qtd_vizinhos, mutacao_media, qtd_fact_checkers, estado_concorrente, rng):
-    """
-    Decide se um ignorante vira espalhador.
-
-    MELHORIA 3 (cont.): mutação alta reduz o limiar de convencimento.
-    MELHORIA 6: Resistência cruzada - já foi infectado pela outra news -> mais difícil aderir.
-    MELHORIA 7: probabilidade base de adesão de 65%.
-
-    `rng` é um Random local determinístico (vindo de rng_celula).
-    """
     if qtd_fact_checkers > 0:
         return IGNORANTE, 0
 
     indice_necessario = 1.75
+    # Mutação alta facilita o convencimento
     if mutacao_media >= 3:
         indice_necessario -= 1
     if mutacao_media >= 6:
         indice_necessario -= 2
+    # Resistência cruzada: já infectado pela outra news dificulta
     if estado_concorrente != IGNORANTE:
         indice_necessario += 3
 
@@ -272,11 +207,10 @@ def calcular_transicao(qtd_vizinhos, mutacao_media, qtd_fact_checkers, estado_co
     return IGNORANTE, 0
 
 
+# ----------------------------------------------------------------------
+# Calcula a próxima geração da grade
+# ----------------------------------------------------------------------
 def proxima_geracao(grade, semente, geracao):
-    """
-    Calcula a próxima geração. `semente` e `geracao` são usadas para derivar
-    o RNG local de cada célula (determinismo paralelo).
-    """
     linhas, colunas = len(grade), len(grade[0])
     nova_grade = [[grade[i][j].clonar() for j in range(colunas)] for i in range(linhas)]
 
@@ -285,6 +219,7 @@ def proxima_geracao(grade, semente, geracao):
             ind_atual = grade[i][j]
             novo_ind = nova_grade[i][j]
 
+            # Obstáculos e fact-checkers não evoluem
             if ind_atual.tipo == TIPO_OBSTACULO or ind_atual.tipo == TIPO_FACT_CHECKER:
                 continue
 
@@ -292,7 +227,7 @@ def proxima_geracao(grade, semente, geracao):
 
             viz_a, mut_a, cura_vizinhos = avaliar_vizinhanca(grade, i, j, 'A')
 
-            # MELHORIA 8: contágio orgânico do fact-checking
+            # Contágio orgânico de fact-checking (2% por vizinho curador)
             if cura_vizinhos >= 1 and rng.random() < 0.02:
                 novo_ind.tipo = TIPO_FACT_CHECKER
                 novo_ind.estado_A = IGNORANTE
@@ -301,16 +236,17 @@ def proxima_geracao(grade, semente, geracao):
 
             viz_b, mut_b, _ = avaliar_vizinhanca(grade, i, j, 'B')
 
-            # Transições do estado A
+            # Transições da fake news A
             if ind_atual.estado_A == IGNORANTE:
                 novo_ind.estado_A, novo_ind.mutacao_A = calcular_transicao(
                     viz_a, mut_a, cura_vizinhos, ind_atual.estado_B, rng
                 )
             elif ind_atual.estado_A == ESPALHADOR:
+                # Espalhador vira inativo (mais rápido perto de fact-checker)
                 if rng.random() < (0.25 if cura_vizinhos > 0 else 0.5):
                     novo_ind.estado_A = INATIVO
 
-            # Transições do estado B
+            # Transições da fake news B
             if ind_atual.estado_B == IGNORANTE:
                 novo_ind.estado_B, novo_ind.mutacao_B = calcular_transicao(
                     viz_b, mut_b, cura_vizinhos, ind_atual.estado_A, rng
@@ -323,18 +259,9 @@ def proxima_geracao(grade, semente, geracao):
 
 
 # ----------------------------------------------------------------------
-# Conversão para visualização e estatísticas
+# Converte a grade em matriz de ints 0-5 para a visualização
 # ----------------------------------------------------------------------
 def grade_para_matriz_visual(grade):
-    """
-    Converte a grade em uma matriz de inteiros 0-5:
-      0 = ignorante puro
-      1 = afetado só por A
-      2 = afetado só por B
-      3 = colisão (afetado por A e B)
-      4 = obstáculo
-      5 = fact-checker
-    """
     linhas, colunas = len(grade), len(grade[0])
     matriz = [[0] * colunas for _ in range(linhas)]
     for i in range(linhas):
@@ -357,7 +284,6 @@ def grade_para_matriz_visual(grade):
 
 
 def contar_estados_visual(visual):
-    """Contagem dos 6 estados na matriz visual."""
     plano = [c for linha in visual for c in linha]
     return {
         'ignorantes': plano.count(0),
@@ -370,7 +296,7 @@ def contar_estados_visual(visual):
 
 
 # ----------------------------------------------------------------------
-# Execução principal
+# Função principal - dispara headless ou gráfico
 # ----------------------------------------------------------------------
 def executar_simulacao(
     linhas=400,
@@ -381,10 +307,9 @@ def executar_simulacao(
     perc_cura=0.002,
     semente=15,
     modo_grafico=False,
-    salvar_animacao=None,   # caminho .gif ou .mp4 opcional, útil fora do Jupyter
+    salvar_animacao=None,
     coletar_historico=True,
 ):
-    """Executa a simulação sequencial completa."""
     grade = criar_grade(
         linhas, colunas,
         perc_espalhadores=perc_espalhadores,
@@ -399,10 +324,10 @@ def executar_simulacao(
         return _executar_headless(grade, geracoes, semente, linhas, colunas, coletar_historico)
 
 
+# ----------------------------------------------------------------------
+# Modo headless - benchmark puro, sem renderização
+# ----------------------------------------------------------------------
 def _executar_headless(grade, geracoes, semente, linhas, colunas, coletar_historico):
-    """
-    MELHORIA 10: modo headless para benchmark - mede CPU e pico real de RAM.
-    """
     print(f"\n[MODO HEADLESS] Benchmark CPU ({linhas}x{colunas}) - {geracoes} gerações")
 
     historico = []
@@ -444,12 +369,10 @@ def _executar_headless(grade, geracoes, semente, linhas, colunas, coletar_histor
     }
 
 
+# ----------------------------------------------------------------------
+# Modo gráfico - gera GIF/MP4 ou janela com a animação
+# ----------------------------------------------------------------------
 def _executar_grafico(grade, geracoes, semente, linhas, colunas, salvar_animacao):
-    """
-    MELHORIA 9: visualização gráfica.
-    Funciona em Jupyter (retorna HTML embutido) e em script .py (chama plt.show()
-    ou salva em arquivo se `salvar_animacao` for fornecido).
-    """
     print(f"\n[MODO GRÁFICO] Renderizando matriz ({linhas}x{colunas}) - {geracoes} gerações...")
     tempo_inicio = time.perf_counter()
 
@@ -475,7 +398,6 @@ def _executar_grafico(grade, geracoes, semente, linhas, colunas, salvar_animacao
     )
 
     if em_jupyter():
-        # Jupyter: gera HTML embedável
         plt.close(fig)
         from IPython.display import HTML
         resultado = HTML(anim.to_jshtml())
@@ -483,7 +405,6 @@ def _executar_grafico(grade, geracoes, semente, linhas, colunas, salvar_animacao
         print(f"Tempo de renderização (inclui UI): {tempo_fim - tempo_inicio:.4f}s")
         return resultado
     else:
-        # Script: salva em arquivo ou exibe janela
         if salvar_animacao:
             print(f"Salvando animação em '{salvar_animacao}'...")
             if salvar_animacao.lower().endswith('.gif'):
@@ -506,7 +427,7 @@ def _executar_grafico(grade, geracoes, semente, linhas, colunas, salvar_animacao
 if __name__ == "__main__":
     gerar_relatorio_ambiente()
 
-    # 1) Benchmark headless (dados para tabelas de speedup/eficiência)
+    # Benchmark
     resultado = executar_simulacao(
         linhas=400,
         colunas=400,
@@ -514,8 +435,7 @@ if __name__ == "__main__":
         modo_grafico=False,
     )
 
-    # 2) Animação para apresentação - salva em GIF se rodar como script,
-    #    ou retorna HTML inline se rodar em Jupyter (use display() lá).
+    # Animação
     if em_jupyter():
         from IPython.display import display
         anim = executar_simulacao(
